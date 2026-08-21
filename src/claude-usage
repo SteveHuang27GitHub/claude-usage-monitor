@@ -185,8 +185,11 @@ def apply_update(state, windows, source):
         if w.get("pct") is None:
             continue
         prev = state["windows"].get(name, {})
-        # window reset (resets_at changed or usage dropped) → clear notification dedupe
-        if prev and (prev.get("resets_at") != w.get("resets_at") or w["pct"] < prev.get("pct", 0) - 5):
+        # window reset (resets_at moved by > 60 s, or usage dropped) → clear notification dedupe.
+        # The API and the status line round resets_at differently (±1 s), so a small drift is not a reset.
+        a, b = prev.get("resets_at"), w.get("resets_at")
+        moved = a is not None and b is not None and abs(a - b) > 60
+        if prev and (moved or w["pct"] < prev.get("pct", 0) - 5):
             state["notified"].pop(name, None)
             if name == "five_hour":
                 state["samples"] = []

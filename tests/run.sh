@@ -101,6 +101,15 @@ sl_json 3 2 | node "$WRAPPER" >/dev/null
 [ "$(state_get "s['notified'].get('five_hour',{}).get('levels')")" = "[]" ] && ok "notified levels cleared" || fail "notified levels cleared"
 [ "$(state_get "len(s['samples'])")" = 1 ] && ok "samples cleared" || fail "samples cleared"
 
+echo "▶ 8b. resets_at drift between sources is not a reset"
+sl_json 40 2 | node "$WRAPPER" >/dev/null
+state_py "s['samples']=[[$((NOW-300)),38],[$((NOW-150)),39],[$NOW,40]]; s['notified']={'five_hour':{'levels':[80]}}"
+printf '{"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":%s}}}' $((NOW+3600-1)) | "$TOOL" record
+[ "$(state_get "len(s['samples'])")" = 4 ] && ok "1 s drift keeps samples" || fail "1 s drift keeps samples" "$(state_get "len(s['samples'])")"
+[ "$(state_get "s['notified']['five_hour']['levels']")" = "[80]" ] && ok "1 s drift keeps notified" || fail "1 s drift keeps notified"
+printf '{"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":%s}}}' $((NOW+3600+7200)) | "$TOOL" record
+[ "$(state_get "len(s['samples'])")" = 1 ] && ok "real window change resets samples" || fail "real window change resets samples"
+
 echo "▶ 9. stale marker"
 state_py "s['updated']-=1200"
 check "status shows stale" "stale" "$("$TOOL" status)"
