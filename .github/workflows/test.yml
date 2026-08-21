@@ -17,11 +17,11 @@ jobs:
         run: |
           export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
           mkdir -p "$CLAUDE_CONFIG_DIR"
-          echo '{"statusLine":{"type":"command","command":"echo ORIG"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+          echo '{"statusLine":{"type":"command","command":"printf ORIG"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
           bash install.sh --no-timer
           grep -q usage-statusline.js "$CLAUDE_CONFIG_DIR/settings.json"
-          grep -q '"inner_statusline": "echo ORIG"' "$CLAUDE_CONFIG_DIR/usage-monitor.json"
+          grep -q '"inner_statusline": "printf ORIG"' "$CLAUDE_CONFIG_DIR/usage-monitor.json"
           echo '{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":9999999999}}}' | node "$CLAUDE_CONFIG_DIR/usage-monitor/usage-statusline.js" | grep -q 'ORIG.*42%'
           bash uninstall.sh
-          grep -q '"command": "echo ORIG"' "$CLAUDE_CONFIG_DIR/settings.json"
+          grep -q '"command": "printf ORIG"' "$CLAUDE_CONFIG_DIR/settings.json"
           ! grep -q usage-guard "$CLAUDE_CONFIG_DIR/settings.json"
