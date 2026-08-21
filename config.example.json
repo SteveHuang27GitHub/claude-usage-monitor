@@ -1,0 +1,14 @@
+{
+  "inner_statusline": "",
+  "thresholds": { "five_hour": [80, 90, 95], "seven_day": [90, 95] },
+  "eta_warn_min": 15,
+  "eta_min_pct": 50,
+  "sample_window_sec": 1200,
+  "stale_sec": 600,
+  "notify": true,
+  "eta_notify_repeat_sec": 600,
+  "guard_repeat_sec": 300,
+  "heavy_tools": ["Agent", "Task", "Workflow"],
+  "deny_level": 2,
+  "lang": "en"
+}

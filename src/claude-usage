@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""claude-usage — real-time Claude Code subscription usage monitor
+
+Subcommands:
+  record    read statusline JSON from stdin, store rate_limits (called by usage-statusline.js)
+  fetch     query /api/oauth/usage and store the result (timer / manual)
+  check     evaluate thresholds + burn rate, send desktop notifications if needed
+  status    human-readable summary
+  segment   ANSI fragment for the status line
+  hook      JSON alert level for usage-guard.py
+  config    print effective configuration
+  checkpoint  emergency wrap-up: append DEVLOG.md entry from the transcript + git commit
+              --cwd DIR --session ID --transcript PATH [--reason TEXT] [--force]
+
+Flags: --notify (record/fetch: also run notifications), --quiet (fetch: no output)
+
+State file : $CLAUDE_CONFIG_DIR/state/usage.json   (default ~/.claude/state/usage.json)
+Config file: $CLAUDE_CONFIG_DIR/usage-monitor.json (optional, see config.example.json)
+"""
+import json
+import os
+import platform
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+STATE_DIR = os.path.join(CLAUDE_DIR, "state")
+STATE_FILE = os.path.join(STATE_DIR, "usage.json")
+LOCK_FILE = os.path.join(STATE_DIR, "usage.lock")
+LOG_FILE = os.path.join(STATE_DIR, "usage-alerts.log")
+CONFIG_FILE = os.path.join(CLAUDE_DIR, "usage-monitor.json")
+CRED_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+WINDOWS = ("five_hour", "seven_day")
+LABEL = {"five_hour": "5h", "seven_day": "7d"}
+
+DEFAULT_CONFIG = {
+    "inner_statusline": "",                 # original statusLine command to wrap ("" = none)
+    "thresholds": {"five_hour": [80, 90, 95], "seven_day": [90, 95]},
+    "eta_warn_min": 15,                     # warn when 5h window is predicted to hit 100% within N min
+    "eta_min_pct": 50,                      # ...but only once usage is above this %
+    "sample_window_sec": 1200,              # burn-rate regression window
+    "stale_sec": 600,                       # mark data stale after N sec without update
+    "notify": True,                         # desktop notifications
+    "eta_notify_repeat_sec": 600,
+    "guard_repeat_sec": 300,                # min interval between context injections per level
+    "heavy_tools": ["Agent", "Task", "Workflow"],
+    "deny_level": 2,                        # PreToolUse denies heavy tools at/above this level
+    "lang": "en",                           # "en" | "zh-TW"
+    # --- graceful wrap-up (checkpoint) ---
+    "checkpoint_level": 3,                  # auto-checkpoint at/above this level (0 = off)
+    "checkpoint_repeat_sec": 600,           # min interval between auto-checkpoints per session
+    "auto_commit": True,                    # git add -A && git commit in the session cwd
+    "devlog_file": "DEVLOG.md",             # relative to repo root (or absolute); "" = no devlog
+    "devlog_transcript_msgs": 4,            # last N assistant messages summarised into the devlog
+    "devlog_transcript_chars": 1500,
+}
+MAX_SAMPLES = 200
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        with open(CONFIG_FILE) as f:
+            user = json.load(f)
+        for k, v in user.items():
+            if k == "thresholds" and isinstance(v, dict):
+                cfg["thresholds"].update(v)
+            else:
+                cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+CFG = load_config()
+
+# ------------------------------------------------------------------ i18n
+MSG = {
+    "en": {
+        "no_data": "No usage data yet (appears after the session's first API response, or run: claude-usage fetch)",
+        "reset": "resets {t}",
+        "in": "in {d}",
+        "reset_done": "(reset)",
+        "burn": "burn rate: {s:.2f}%/min",
+        "eta": ", ~{m:.0f} min to limit",
+        "updated": "updated {a}s ago ({src})",
+        "stale": "  ⚠ stale",
+        "alerts": "alerts: ",
+        "a_pct": "{w} usage {p:.0f}%, resets {t}",
+        "a_eta": "5h burn rate {s:.1f}%/min, ~{m:.0f} min to limit",
+        "n_pct_t": "Claude {w} usage {p:.0f}% (≥{th}%)",
+        "n_pct_b": "resets {t}",
+        "n_eta_t": "Claude 5h limit in ~{m:.0f} min",
+        "n_eta_b": "now {p:.0f}%, burn rate {s:.1f}%/min",
+    },
+    "zh-TW": {
+        "no_data": "尚無用量資料（session 第一次 API 回應後才會出現，或執行 claude-usage fetch）",
+        "reset": "{t} 重置",
+        "in": "還有 {d}",
+        "reset_done": "(已重置)",
+        "burn": "燃燒率: {s:.2f}%/min",
+        "eta": "，預估 {m:.0f} 分鐘後到頂",
+        "updated": "更新: {a}s 前 ({src})",
+        "stale": "  ⚠ stale",
+        "alerts": "警示: ",
+        "a_pct": "{w} 用量 {p:.0f}%，{t} 重置",
+        "a_eta": "5h 燃燒率 {s:.1f}%/min，預估 {m:.0f} 分鐘後到頂",
+        "n_pct_t": "Claude {w} 用量 {p:.0f}% (≥{th}%)",
+        "n_pct_b": "重置時間 {t}",
+        "n_eta_t": "Claude 5h 額度預估 {m:.0f} 分鐘後用完",
+        "n_eta_b": "目前 {p:.0f}%，燃燒率 {s:.1f}%/min",
+    },
+}
+
+
+def t(key, **kw):
+    table = MSG.get(CFG.get("lang", "en"), MSG["en"])
+    return table.get(key, MSG["en"][key]).format(**kw)
+
+
+# ------------------------------------------------------------------ state I/O
+def _empty_state():
+    return {"windows": {}, "samples": [], "notified": {}, "updated": 0, "source": ""}
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+        for k, v in _empty_state().items():
+            s.setdefault(k, v)
+        return s
+    except Exception:
+        return _empty_state()
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
+class locked:
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.fh = open(LOCK_FILE, "w")
+        if fcntl:
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        if fcntl:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+# ------------------------------------------------------------------ updates
+def _to_epoch(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def apply_update(state, windows, source):
+    now = int(time.time())
+    for name, w in windows.items():
+        if w.get("pct") is None:
+            continue
+        prev = state["windows"].get(name, {})
+        # window reset (resets_at changed or usage dropped) → clear notification dedupe
+        if prev and (prev.get("resets_at") != w.get("resets_at") or w["pct"] < prev.get("pct", 0) - 5):
+            state["notified"].pop(name, None)
+            if name == "five_hour":
+                state["samples"] = []
+        state["windows"][name] = {"pct": float(w["pct"]), "resets_at": w.get("resets_at")}
+    if windows.get("five_hour", {}).get("pct") is not None:
+        samples = state["samples"]
+        if not samples or samples[-1][0] != now:
+            samples.append([now, float(windows["five_hour"]["pct"])])
+        state["samples"] = samples[-MAX_SAMPLES:]
+    state["updated"] = now
+    state["source"] = source
+
+
+def parse_statusline(data):
+    rl = data.get("rate_limits") or {}
+    out = {}
+    for name in WINDOWS:
+        w = rl.get(name)
+        if w and w.get("used_percentage") is not None:
+            out[name] = {"pct": w["used_percentage"], "resets_at": _to_epoch(w.get("resets_at"))}
+    return out
+
+
+def _access_token():
+    if os.path.exists(CRED_FILE):
+        with open(CRED_FILE) as f:
+            return json.load(f)["claudeAiOauth"]["accessToken"]
+    if platform.system() == "Darwin":
+        r = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)["claudeAiOauth"]["accessToken"]
+    raise RuntimeError("no Claude Code OAuth credentials found (API-key / Bedrock / Vertex sessions have no plan limits)")
+
+
+def fetch_api():
+    tok = _access_token()
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-usage-monitor"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.load(r)
+    out = {}
+    for name in WINDOWS:
+        w = data.get(name)
+        if w and w.get("utilization") is not None:
+            out[name] = {"pct": w["utilization"], "resets_at": _to_epoch(w.get("resets_at"))}
+    return out
+
+
+# ------------------------------------------------------------------ analysis
+def burn_rate(state):
+    """(pct_per_min, eta_min); (None, None) if not enough data"""
+    now = time.time()
+    pts = [(a, b) for a, b in state["samples"] if now - a <= CFG["sample_window_sec"]]
+    if len(pts) < 3 or pts[-1][0] - pts[0][0] < 120:
+        return None, None
+    n = len(pts)
+    mt = sum(a for a, _ in pts) / n
+    mp = sum(b for _, b in pts) / n
+    den = sum((a - mt) ** 2 for a, _ in pts)
+    if den == 0:
+        return None, None
+    slope = sum((a - mt) * (b - mp) for a, b in pts) / den * 60
+    if slope <= 0.01:
+        return slope, None
+    return slope, (100 - pts[-1][1]) / slope
+
+
+def _eta_alert(state):
+    slope, eta = burn_rate(state)
+    w5 = state["windows"].get("five_hour")
+    if eta is not None and w5 and w5["pct"] >= CFG["eta_min_pct"] and eta < CFG["eta_warn_min"]:
+        return slope, eta
+    return None, None
+
+
+def fmt_reset(epoch):
+    if not epoch:
+        return "?"
+    dt = datetime.fromtimestamp(epoch)
+    mins = int((epoch - time.time()) / 60)
+    if mins < 0:
+        return dt.strftime("%H:%M ") + t("reset_done")
+    h, m = divmod(mins, 60)
+    d = f"{h}h{m:02d}m" if h else f"{m}m"
+    return dt.strftime("%H:%M") + " (" + t("in", d=d) + ")"
+
+
+def evaluate(state):
+    alerts, level = [], 0
+    for name in WINDOWS:
+        w = state["windows"].get(name)
+        if not w:
+            continue
+        ths = CFG["thresholds"].get(name, [])
+        for i, th in enumerate(ths):
+            if w["pct"] >= th:
+                level = max(level, i + 1)
+        if ths and w["pct"] >= ths[0]:
+            alerts.append(t("a_pct", w=LABEL[name], p=w["pct"], t=fmt_reset(w["resets_at"])))
+    slope, eta = _eta_alert(state)
+    if eta is not None:
+        level = max(level, 2)
+        alerts.append(t("a_eta", s=slope, m=eta))
+    _, eta_any = burn_rate(state)
+    parts = [f"{LABEL[n]} {state['windows'][n]['pct']:.0f}%" for n in WINDOWS if n in state["windows"]]
+    if eta_any is not None:
+        parts.append(f"ETA {eta_any:.0f}m")
+    return {"level": level, "alerts": alerts, "summary": " | ".join(parts), "eta": eta_any}
+
+
+def stale(state):
+    return time.time() - state.get("updated", 0) > CFG["stale_sec"]
+
+
+# ------------------------------------------------------------------ notifications
+def notify(state):
+    sent = []
+    for name in WINDOWS:
+        w = state["windows"].get(name)
+        if not w:
+            continue
+        rec = state["notified"].setdefault(name, {"window": w["resets_at"], "levels": []})
+        for th in CFG["thresholds"].get(name, []):
+            if w["pct"] >= th and th not in rec["levels"]:
+                rec["levels"].append(th)
+                sent.append((th >= 95, t("n_pct_t", w=LABEL[name], p=w["pct"], th=th),
+                             t("n_pct_b", t=fmt_reset(w["resets_at"]))))
+    slope, eta = _eta_alert(state)
+    if eta is not None:
+        rec = state["notified"].setdefault("eta", {"last": 0})
+        if time.time() - rec.get("last", 0) > CFG["eta_notify_repeat_sec"]:
+            rec["last"] = int(time.time())
+            w5 = state["windows"]["five_hour"]
+            sent.append((True, t("n_eta_t", m=eta), t("n_eta_b", p=w5["pct"], s=slope)))
+    for critical, title, body in sent:
+        _desktop_notify(title, body, critical)
+        _log(f"{title} — {body}")
+    return sent
+
+
+def _desktop_notify(title, body, critical):
+    if os.environ.get("NOTIFY_DISABLE") or not CFG.get("notify", True):
+        return
+    try:
+        if platform.system() == "Darwin":
+            script = f'display notification "{body}" with title "{title}" sound name "Basso"'
+            subprocess.run(["osascript", "-e", script], timeout=5, capture_output=True)
+        else:
+            env = dict(os.environ)
+            env.setdefault("DISPLAY", ":0")
+            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+            subprocess.run(["notify-send", "-a", "claude-usage", "-u", "critical" if critical else "normal",
+                            "-i", "dialog-warning", title, body], env=env, timeout=5, capture_output=True)
+    except Exception:
+        pass
+
+
+def _log(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ checkpoint
+def _git(cwd, *args):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stdout.rstrip("\n")
+
+
+def _transcript_tail(path, n, max_chars):
+    """last n assistant text blocks from a Claude Code transcript (.jsonl)"""
+    if not path or not os.path.exists(path):
+        return []
+    msgs = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                content = (rec.get("message") or {}).get("content") or []
+                if isinstance(content, str):
+                    txt = content
+                else:
+                    txt = "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+                txt = txt.strip()
+                if txt:
+                    msgs.append(txt)
+    except Exception:
+        return []
+    out, total = [], 0
+    for m in reversed(msgs[-n:]):
+        m = m[: max_chars - total]
+        out.insert(0, m)
+        total += len(m)
+        if total >= max_chars:
+            break
+    return out
+
+
+def checkpoint(cwd, session, transcript, reason, force=False):
+    """returns dict(actions=[...], skipped=str|None)"""
+    actions = []
+    mark = os.path.join(tempfile.gettempdir(), f"claude-usage-ckpt-{session or 'nosession'}.json")
+    if not force:
+        try:
+            last = json.load(open(mark)).get("last", 0)
+            if time.time() - last < CFG["checkpoint_repeat_sec"]:
+                return {"actions": [], "skipped": "recent"}
+        except Exception:
+            pass
+    rc, root = _git(cwd, "rev-parse", "--show-toplevel")
+    if rc != 0:
+        return {"actions": [], "skipped": "not a git repo"}
+    _, branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    _, status = _git(root, "status", "--porcelain")
+    changed = [l[3:] for l in status.splitlines() if len(l) > 3]
+
+    state = load_state()
+    summary = evaluate(state)["summary"]
+    if CFG["devlog_file"]:
+        dev = CFG["devlog_file"]
+        dev = dev if os.path.isabs(dev) else os.path.join(root, dev)
+        tail = _transcript_tail(transcript, CFG["devlog_transcript_msgs"], CFG["devlog_transcript_chars"])
+        entry = [f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} — auto-checkpoint ({reason})",
+                 f"- usage: {summary or 'n/a'}", f"- branch: {branch}", f"- session: {session or 'n/a'}",
+                 "- changed files: " + (", ".join(changed[:30]) + (" …" if len(changed) > 30 else "") if changed else "(clean)")]
+        if tail:
+            entry.append("- last assistant messages:")
+            entry.append("\n".join("  > " + l for m in tail for l in m.splitlines()))
+        entry.append("- TODO: replace this stub with what was in progress and the next step.\n")
+        try:
+            new = not os.path.exists(dev)
+            with open(dev, "a") as f:
+                if new:
+                    f.write("# DEVLOG\n")
+                f.write("\n".join(entry))
+            actions.append(f"devlog: {dev}")
+        except Exception as e:
+            actions.append(f"devlog failed: {e}")
+    if CFG["auto_commit"]:
+        _git(root, "add", "-A")
+        rc, _ = _git(root, "diff", "--cached", "--quiet")
+        if rc == 0:
+            actions.append("git: nothing to commit")
+        else:
+            msg = f"checkpoint: auto-commit by claude-usage-monitor ({reason})"
+            rc, out = _git(root, "commit", "-q", "-m", msg)
+            actions.append("git: committed" if rc == 0 else f"git commit failed: {out[:200]}")
+    try:
+        json.dump({"last": int(time.time())}, open(mark, "w"))
+    except Exception:
+        pass
+    _log(f"checkpoint {root}: " + "; ".join(actions))
+    return {"actions": actions, "skipped": None}
+
+
+# ------------------------------------------------------------------ output
+def color_pct(pct):
+    c = "\x1b[32m" if pct < 70 else "\x1b[33m" if pct < 90 else "\x1b[5;31m"
+    return f"{c}{pct:.0f}%\x1b[0m"
+
+
+def segment(state):
+    if not state["windows"]:
+        return ""
+    parts = [f"{LABEL[n]} {color_pct(state['windows'][n]['pct'])}" for n in WINDOWS if n in state["windows"]]
+    _, eta = burn_rate(state)
+    if eta is not None and eta < 60:
+        parts.append(f"\x1b[31m⏳{eta:.0f}m\x1b[0m")
+    s = " │ ⚡" + " ".join(parts)
+    if stale(state):
+        s += " \x1b[2m(stale)\x1b[0m"
+    return s
+
+
+def status_text(state):
+    if not state["windows"]:
+        return t("no_data")
+    lines = []
+    for name in WINDOWS:
+        w = state["windows"].get(name)
+        if w:
+            lines.append(f"{LABEL[name]:>3}: {w['pct']:5.1f}%  " + t("reset", t=fmt_reset(w["resets_at"])))
+    slope, eta = burn_rate(state)
+    if slope is not None:
+        lines.append(t("burn", s=slope) + (t("eta", m=eta) if eta else ""))
+    lines.append(t("updated", a=int(time.time() - state["updated"]), src=state["source"]) + (t("stale") if stale(state) else ""))
+    ev = evaluate(state)
+    if ev["alerts"]:
+        lines.append(t("alerts") + "; ".join(ev["alerts"]))
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ main
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    do_notify = "--notify" in argv
+
+    if cmd == "record":
+        try:
+            windows = parse_statusline(json.load(sys.stdin))
+        except Exception:
+            return 0
+        if not windows:
+            return 0
+        with locked():
+            state = load_state()
+            apply_update(state, windows, "statusline")
+            if do_notify:
+                notify(state)
+            save_state(state)
+        return 0
+
+    if cmd == "fetch":
+        try:
+            windows = fetch_api()
+        except Exception as e:
+            print(f"fetch failed: {e}", file=sys.stderr)
+            return 1
+        with locked():
+            state = load_state()
+            apply_update(state, windows, "api")
+            if do_notify:
+                notify(state)
+            save_state(state)
+        if "--quiet" not in argv:
+            print(status_text(state))
+        return 0
+
+    if cmd == "check":
+        with locked():
+            state = load_state()
+            sent = notify(state)
+            save_state(state)
+        for _, title, body in sent:
+            print(f"notified: {title} — {body}")
+        print(status_text(state))
+        return 0
+
+    if cmd == "segment":
+        sys.stdout.write(segment(load_state()))
+        return 0
+
+    if cmd == "hook":
+        state = load_state()
+        ev = evaluate(state)
+        ev.update({"stale": stale(state), "updated": state["updated"],
+                   "deny_level": CFG["deny_level"], "heavy_tools": CFG["heavy_tools"],
+                   "guard_repeat_sec": CFG["guard_repeat_sec"], "lang": CFG.get("lang", "en"),
+                   "checkpoint_level": CFG["checkpoint_level"]})
+        print(json.dumps(ev, ensure_ascii=False))
+        return 0
+
+    if cmd == "checkpoint":
+        def opt(name, default=None):
+            return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
+        res = checkpoint(opt("--cwd", os.getcwd()), opt("--session", ""), opt("--transcript", ""),
+                         opt("--reason", "manual"), force="--force" in argv)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+
+    if cmd == "config":
+        print(json.dumps(CFG, indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "status":
+        print(status_text(load_state()))
+        return 0
+
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

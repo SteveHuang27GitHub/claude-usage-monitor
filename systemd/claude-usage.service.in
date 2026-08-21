@@ -1,0 +1,6 @@
+[Unit]
+Description=claude-usage-monitor: poll Claude Code usage and notify
+
+[Service]
+Type=oneshot
+ExecStart=@DEST@/claude-usage fetch --notify --quiet
