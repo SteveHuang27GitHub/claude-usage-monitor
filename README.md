@@ -35,7 +35,7 @@ Requirements: Claude Code with a Claude.ai subscription (Pro / Max / Team / Ente
 Linux or macOS (Windows: the status line + hooks work, notifications and the poller do not).
 
 ```bash
-git clone https://github.com/<you>/claude-usage-monitor
+git clone https://github.com/SteveHuang27GitHub/claude-usage-monitor
 cd claude-usage-monitor
 ./install.sh              # add --lang zh-TW for Traditional Chinese messages
 ```
