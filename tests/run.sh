@@ -150,7 +150,7 @@ check "auto-commit made" "checkpoint: auto-commit" "$(git -C "$REPO" log -1 --fo
 check "worktree clean after commit" "^$" "$(git -C "$REPO" status --porcelain)"
 out=$(printf '{"hook_event_name":"PostToolUse","session_id":"%s","cwd":"%s","transcript_path":"%s"}' "$SESSION" "$REPO" "$TR" | python3 "$GUARD")
 check "PostToolUse level 3 injects with checkpoint note absent (deduped)" "level 3" "$out"
-[ "$(git -C "$REPO" log --oneline | wc -l)" = 2 ] && ok "checkpoint deduped (still 2 commits)" || fail "checkpoint deduped"
+[ "$(git -C "$REPO" rev-list --count HEAD)" = 2 ] && ok "checkpoint deduped (still 2 commits)" || fail "checkpoint deduped"
 echo more >> "$REPO/a.txt"
 out=$("$TOOL" checkpoint --cwd "$REPO" --session "$SESSION" --reason manual --force)
 check "manual --force checkpoint commits again" '"git: committed"' "$out"
